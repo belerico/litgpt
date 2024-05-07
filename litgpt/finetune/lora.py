@@ -1,16 +1,18 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 import dataclasses
-from functools import partial
 import math
 import os
 import time
+import warnings
+from functools import partial
 from pathlib import Path
 from pprint import pprint
 from typing import Dict, List, Literal, Optional, Tuple, Union
-import warnings
 
 import lightning as L
 import torch
+import tqdm
+import yaml
 from lightning.fabric.plugins import BitsandbytesPrecision
 from lightning.fabric.strategies import FSDPStrategy
 from lightning.fabric.utilities import ThroughputMonitor
@@ -40,8 +42,8 @@ from litgpt.utils import (
     copy_config_files,
     find_multiple,
     get_default_supported_precision,
-    load_checkpoint,
     init_out_dir,
+    load_checkpoint,
     num_parameters,
     parse_devices,
     save_hyperparameters,
@@ -54,6 +56,7 @@ def setup(
     precision: Optional[str] = None,
     quantize: Optional[Literal["bnb.nf4", "bnb.nf4-dq", "bnb.fp4", "bnb.fp4-dq", "bnb.int8-training"]] = None,
     devices: Union[int, str] = 1,
+    resume: Union[bool, Path] = False,
     lora_r: int = 8,
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
@@ -156,12 +159,13 @@ def setup(
         strategy = "auto"
 
     fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=logger, plugins=plugins)
-    fabric.launch(main, devices, seed, config, data, checkpoint_dir, out_dir, train, eval, longlora)
+    fabric.launch(main, devices, resume, seed, config, data, checkpoint_dir, out_dir, train, eval, longlora)
 
 
 def main(
     fabric: L.Fabric,
     devices: int,
+    resume: Union[bool, Path],
     seed: int,
     config: Config,
     data: DataModule,
@@ -172,6 +176,18 @@ def main(
     longlora: LongLoraArgs,
 ) -> None:
     validate_args(train, eval)
+    if resume is True:
+        resume = max(out_dir.rglob("step-*/*.pth"), key=(lambda p: int(p.parent.name.split("-")[1])))
+    if resume:
+        with open(resume.parent / "hyperparameters.yaml", "r") as f:
+            hyperparams = yaml.safe_load(f)
+        longlora_cfg = hyperparams.get("longlora", None)
+        if longlora_cfg is not None:
+            longlora.use_longlora = longlora_cfg.get("use_longlora", False)
+            longlora.n_groups = longlora_cfg.get("n_groups", longlora.n_groups)
+            longlora.context_length = longlora_cfg.get("context_length", longlora.context_length)
+            config.use_longlora = longlora.use_longlora
+            config.longlora_n_groups = longlora.n_groups
     validate_longlora_args(config, longlora)
 
     tokenizer = Tokenizer(checkpoint_dir)
@@ -202,10 +218,12 @@ def main(
     mark_only_lora_as_trainable(model)
 
     # Let other layers be trainable
+    print(f"Trainable parameters: {longlora.trainable_params}")
     if longlora.use_longlora and longlora.trainable_params != "":
         trainable_params = set(longlora.trainable_params.strip().split(","))
         for n, p in model.named_parameters():
             if any(trainable_p_name in n for trainable_p_name in trainable_params):
+                fabric.print(f"Making parameter {n} trainable")
                 p.requires_grad = True
 
     fabric.print(f"Number of trainable parameters: {num_parameters(model, requires_grad=True):,}")
@@ -225,19 +243,23 @@ def main(
     )
     optimizer = fabric.setup_optimizers(optimizer)
     scheduler = get_lr_scheduler(optimizer, warmup_steps=train.lr_warmup_steps, max_steps=lr_max_steps)
+    state = {"model": model, "optimizer": optimizer, "scheduler": scheduler, "iter_num": 0, "step_count": 0}
 
     # strict=False because missing keys due to LoRA weights not contained in state dict
-    load_checkpoint(fabric, model, checkpoint_path, strict=False)
+    if resume:
+        fabric.print(f"Resuming training from {resume}")
+        fabric.load(resume, state, strict=False)
+    else:
+        load_checkpoint(fabric, state["model"], checkpoint_path, strict=False)
 
     train_time = time.perf_counter()
     fit(
         fabric,
-        model,
-        optimizer,
-        scheduler,
+        state,
         train_dataloader,
         val_dataloader,
         devices,
+        resume,
         checkpoint_dir,
         out_dir,
         train,
@@ -269,12 +291,11 @@ def main(
 
 def fit(
     fabric: L.Fabric,
-    model: GPT,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler,
+    state: Dict,
     train_dataloader: DataLoader,
     val_dataloader: DataLoader,
     devices: int,
+    resume: Union[bool, Path],
     checkpoint_dir: Path,
     out_dir: Path,
     train: TrainArgs,
@@ -282,6 +303,9 @@ def fit(
     longlora: LongLoraArgs,
     data: DataModule,
 ) -> None:
+    model: GPT = state["model"]
+    optimizer = state["optimizer"]
+    scheduler = state["scheduler"]
     tokenizer = Tokenizer(checkpoint_dir)
     longest_seq_length, longest_seq_ix = get_longest_seq_length(train_dataloader.dataset)
     longest_seq_length = min(longest_seq_length, train.max_seq_length or float("inf"))
@@ -300,24 +324,35 @@ def fit(
         validate(fabric, model, val_dataloader, dataclasses.replace(eval, max_iters=2))  # sanity check
         val_loss = "n/a"
 
+    initial_iter = state["iter_num"]
+    max_steps = train.max_steps or float("inf")
     train_iterator = CycleIterator(train_dataloader)
-    throughput = ThroughputMonitor(fabric, window_size=50)
+
+    # resume data loader state by fast-forwarding through all seen batches
+    if resume:
+        resume_t0 = time.perf_counter()
+        for resume_iter in range(initial_iter):
+            next(train_iterator)
+            if resume_iter % 1000 == 0:
+                fabric.print(f"Resuming dataset: {resume_iter} / {initial_iter}")
+        fabric.barrier()
+        fabric.print(
+            f"Resuming data loader finished. Took {time.perf_counter() - resume_t0:.1f} seconds to reach iteration"
+            f" {initial_iter}."
+        )
+
     running_loss = RunningMean(window=train.gradient_accumulation_iters(devices), sync_on_compute=False).to(
         fabric.device
     )
-    max_steps = train.max_steps or float("inf")
-    step_count = 0
-    iter_num = 0
-    total_lengths = 0
-    total_t0 = time.perf_counter()
+    fabric.barrier()
 
-    while step_count < max_steps and train_iterator.epoch < train.epochs:
-        iter_num += 1
+    while state["step_count"] < max_steps and train_iterator.epoch < train.epochs:
+        state["iter_num"] += 1
         iter_t0 = time.perf_counter()
         batch = next(train_iterator)
         input_ids, targets = batch["input_ids"], batch["labels"]
 
-        is_accumulating = iter_num % train.gradient_accumulation_iters(devices) != 0
+        is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
             logits = model(input_ids, lm_head_chunk_size=128)
             # shift the targets such that output n predicts token n+1
@@ -331,24 +366,19 @@ def fit(
             optimizer.step()
             optimizer.zero_grad()
             scheduler.step()
-            step_count += 1
+            state["step_count"] += 1
 
-        total_lengths += input_ids.numel()
-        if iter_num % train.log_interval == 0:
+        if state["iter_num"] % train.log_interval == 0:
             loss = running_loss.compute().item()  # expensive device-to-host synchronization
             t1 = time.perf_counter()
-            throughput.update(
-                time=t1 - total_t0, batches=iter_num, samples=iter_num * train.micro_batch_size, lengths=total_lengths
-            )
-            throughput.compute_and_log(step=iter_num)
             metrics = {
                 "loss": loss,
-                "iter": iter_num,
-                "step": step_count,
+                "iter": state["iter_num"],
+                "step": state["step_count"],
                 "epoch": train_iterator.epoch,
                 "iter_time": t1 - iter_t0,
-                "tokens": iter_num * train.micro_batch_size * model.config.block_size,
-                "total_tokens": (iter_num * train.micro_batch_size * model.config.block_size * fabric.world_size),
+                "tokens": state["iter_num"] * train.micro_batch_size * model.config.block_size,
+                "total_tokens": (state["iter_num"] * train.micro_batch_size * model.config.block_size * fabric.world_size),
                 "learning_rate": scheduler.get_last_lr()[0],
             }
             if isinstance(val_loss, torch.Tensor):
@@ -360,20 +390,20 @@ def fit(
                 f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
                 f"{' (step)' if not is_accumulating else ''}"
             )
-            fabric.log_dict(metrics, step=iter_num)
+            fabric.log_dict(metrics, step=state["iter_num"])
 
-        if not is_accumulating and step_count % eval.interval == 0:
+        if not is_accumulating and state["step_count"] % eval.interval == 0:
             t0 = time.perf_counter()
             val_loss = validate(fabric, model, val_dataloader, eval)
             generate_example(fabric, model, tokenizer, eval, data)
             t1 = time.perf_counter() - t0
-            fabric.print(f"iter {iter_num}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f} ms")
+            fabric.print(f"iter {state['iter_num']}: val loss {val_loss.item():.4f}, val time: {t1 * 1000:.2f} ms")
             metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-            fabric.log_dict(metrics, step=iter_num)
+            fabric.log_dict(metrics, step=state["iter_num"])
             fabric.barrier()
 
-        if train.save_interval is not None and not is_accumulating and step_count % train.save_interval == 0:
-            checkpoint_file = out_dir / f"step-{step_count:06d}" / "lit_model.pth.lora"
+        if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
+            checkpoint_file = out_dir / f"step-{state['step_count']:06d}" / "lit_model.pth.lora"
             checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
             save_lora_checkpoint(fabric, model, checkpoint_file, longlora=longlora)
             if fabric.global_rank == 0:
@@ -492,7 +522,7 @@ def validate_args(train: TrainArgs, eval: EvalArgs) -> None:
 
 def validate_longlora_args(config: Config, longlora: LongLoraArgs):
     if longlora.use_longlora:
-        if longlora.context_length <= config.block_size:
+        if longlora.context_length < config.block_size:
             warnings.warn(
                 f"LongLora is disabled because the LongLora context length ({longlora.context_length}) "
                 f"is less than the model original block size {config.block_size}. "
