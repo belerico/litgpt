@@ -1561,6 +1561,30 @@ for c in tiny_llama:
         configs.append(copy)
 
 
+##############
+# TableLLama #
+##############
+tablellama = [
+    dict(
+        name="TableLLama",
+        hf_config=dict(org="osunlp", name="TableLLama"),
+        block_size=8192,
+        rope_condense_ratio=2,
+        vocab_size=32001,
+        padding_multiple=1,
+        n_layer=32,
+        rotary_percentage=1.0,
+        parallel_residual=False,
+        bias=False,
+        norm_class_name="RMSNorm",
+        mlp_class_name="LLaMAMLP",
+        intermediate_size=11008,
+    )
+]
+
+configs.extend(tablellama)
+
+
 ##########################
 # Trelis Function Calling
 ##########################
