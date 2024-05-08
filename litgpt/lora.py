@@ -62,7 +62,14 @@ from litgpt.utils import map_old_state_dict_weights
 
 
 class LoRALayer(nn.Module):
-    def __init__(self, r: int, lora_alpha: int, lora_dropout: float):
+    def __init__(
+        self,
+        r: int,
+        lora_alpha: int,
+        lora_input_dropout: float,
+        lora_A_dropout: float = 0.0,
+        lora_B_dropout: float = 0.0,
+    ):
         """Store LoRA specific attributes in a class.
 
         Args:
@@ -71,17 +78,28 @@ class LoRALayer(nn.Module):
             lora_alpha: alpha is needed for scaling updates as alpha/r
                 "This scaling helps to reduce the need to retune hyperparameters when we vary r"
                 https://arxiv.org/pdf/2106.09685.pdf (section 4.1)
-            lora_dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+            lora_input_dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+            lora_A_dropout: dropout that is applied on the matrix A
+            lora_B_dropout: dropout that is applied on the matrix B
         """
         super().__init__()
         assert r >= 0
         self.r = r
         self.lora_alpha = lora_alpha
         # Optional dropout
-        if lora_dropout > 0.0:
-            self.lora_dropout = nn.Dropout(p=lora_dropout)
+        if lora_input_dropout > 0.0:
+            self.lora_input_dropout = nn.Dropout(p=lora_input_dropout)
         else:
-            self.lora_dropout = lambda x: x
+            self.lora_input_dropout = lambda x: x
+        if lora_A_dropout > 0.0:
+            # self.lora_A_dropout = lambda x: x * (torch.rand((x.size(-1),), device=x.device) < (1 - lora_A_dropout))
+            self.lora_A_dropout = lambda x: x * torch.empty(x.size(-1), device=x.device, dtype=x.dtype).bernoulli_(1 - lora_A_dropout)
+        else:
+            self.lora_A_dropout = lambda x: x
+        if lora_B_dropout > 0.0:
+            self.lora_B_dropout = lambda x: x * torch.empty(x.size(-1), device=x.device, dtype=x.dtype).bernoulli_(1 - lora_B_dropout)
+        else:
+            self.lora_B_dropout = lambda x: x
         # Mark the weight as unmerged
         self.merged = False
 
@@ -96,7 +114,9 @@ class LoRALinear(LoRALayer):
         # ↓ the remaining part is for LoRA
         r: int = 0,
         lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
+        lora_input_dropout: float = 0.0,
+        lora_A_dropout: float = 0.0,
+        lora_B_dropout: float = 0.0,
         **kwargs: Any,
     ):
         """LoRA wrapper around linear class.
@@ -115,9 +135,17 @@ class LoRALinear(LoRALayer):
             lora_alpha: alpha is needed for scaling updates as alpha/r
                 "This scaling helps to reduce the need to retune hyperparameters when we vary r"
                 https://arxiv.org/pdf/2106.09685.pdf (section 4.1)
-            lora_dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+            lora_input_dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+            lora_A_dropout: dropout that is applied on the matrix A
+            lora_B_dropout: dropout that is applied on the matrix B
         """
-        super().__init__(r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+        super().__init__(
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_input_dropout=lora_input_dropout,
+            lora_A_dropout=lora_A_dropout,
+            lora_B_dropout=lora_B_dropout,
+        )
         self.linear = torch.nn.Linear(in_features, out_features, **kwargs)
 
         # Actual trainable parameters
@@ -168,7 +196,11 @@ class LoRALinear(LoRALayer):
         pretrained = self.linear(x)
         if self.r == 0 or self.merged:
             return pretrained
-        lora = (self.lora_dropout(x) @ self.lora_A.transpose(0, 1) @ self.lora_B.transpose(0, 1)) * self.scaling
+        lora = (
+            self.lora_input_dropout(x)
+            @ self.lora_A_dropout(self.lora_A).transpose(0, 1)
+            @ self.lora_B_dropout(self.lora_B.transpose(0, 1))
+        ) * self.scaling
         return pretrained + lora
 
 
@@ -185,7 +217,9 @@ class LoRAQKVLinear(LoRALinear):
         n_query_groups: int,
         r: int = 0,
         lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
+        lora_input_dropout: float = 0.0,
+        lora_A_dropout: float = 0.0,
+        lora_B_dropout: float = 0.0,
         enable_lora: Union[bool, Tuple[bool, bool, bool]] = False,
         **kwargs: Any,
     ):
@@ -208,12 +242,20 @@ class LoRAQKVLinear(LoRALinear):
             lora_alpha: alpha is needed for scaling updates as alpha/r
                 "This scaling helps to reduce the need to retune hyperparameters when we vary r"
                 https://arxiv.org/pdf/2106.09685.pdf (section 4.1)
-            lora_dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+            lora_input_dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+            lora_A_dropout: dropout that is applied on the matrix A
+            lora_B_dropout: dropout that is applied on the matrix B
             enable_lora: MergeLinear class is for attention mechanism where qkv are calculated with a single weight matrix. If we
                 don't want to apply LoRA we can set it as False. For example if we want to apply LoRA only to `query`
                 and `value` but keep `key` without weight updates we should pass `[True, False, True]`
         """
-        super(LoRALinear, self).__init__(r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout)
+        super(LoRALinear, self).__init__(
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_input_dropout=lora_input_dropout,
+            lora_A_dropout=lora_A_dropout,
+            lora_B_dropout=lora_B_dropout,
+        )
         self.linear = torch.nn.Linear(in_features, out_features, **kwargs)
         self.n_head = n_head
         self.n_query_groups = n_query_groups
@@ -417,13 +459,15 @@ class LoRAQKVLinear(LoRALinear):
         pretrained = self.linear(x)
         if self.r == 0 or not any(self.enable_lora) or self.merged:
             return pretrained
-        after_A = F.linear(self.lora_dropout(x), self.lora_A)  # (64, 64, 128) @ (4, 128) -> (64, 64, 4)
+        after_A = F.linear(
+            self.lora_input_dropout(x), self.lora_A_dropout(self.lora_A)
+        )  # (64, 64, 128) @ (4, 128) -> (64, 64, 4)
         # For F.conv1d:
         # ⚬ input: input tensor of shape (mini-batch, in_channels, iW)
         # ⚬ weight: filters of shape (out_channels, in_channels/groups, kW)
         after_B = self.conv1d(
             after_A.transpose(-2, -1),  # (64, 64, 4) -> (64, 4, 64)
-            self.lora_B.unsqueeze(-1),  # (256, 2) -> (256, 2, 1)
+            self.lora_B_dropout(self.lora_B.transpose(0, 1)).transpose(0, 1).unsqueeze(-1),  # (256, 2) -> (256, 2, 1)
         ).transpose(
             -2, -1
         )  # (64, 4, 64) @ (256, 2, 1) -> (64, 256, 64) -> (64, 64, 256)
@@ -477,13 +521,16 @@ class Config(BaseConfig):
         lora_alpha: alpha is needed for scaling updates as alpha/r
             "This scaling helps to reduce the need to retune hyperparameters when we vary r"
             https://arxiv.org/pdf/2106.09685.pdf (section 4.1)
-        lora_dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
+        lora_input_dropout: dropout that is applied on the input in the LoRA branch (before multiplying by matrix A)
         lora_*: whether to apply LoRA to the specified weights or not
     """
 
     lora_r: int = 0
     lora_alpha: int = 1
-    lora_dropout: float = 0.0
+    lora_input_dropout: float = 0.0
+    lora_A_dropout: float = 0.0
+    lora_B_dropout: float = 0.0
+    lora_dropout_samples: int = 1
     lora_query: bool = False
     lora_key: bool = False
     lora_value: bool = False
@@ -508,7 +555,9 @@ class GPT(BaseModel):
             bias=config.lm_head_bias,
             r=(config.lora_r if config.lora_head else 0),
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
         )
         self.transformer = nn.ModuleDict(
             dict(
@@ -590,7 +639,9 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             out_features=shape,
             r=config.lora_r,
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
             enable_lora=(config.lora_query, config.lora_key, config.lora_value),
             bias=config.bias,
             # for MQA/GQA support
@@ -606,7 +657,9 @@ class CausalSelfAttention(BaseCausalSelfAttention):
             bias=config.bias,
             r=(config.lora_r if config.lora_projection else 0),
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
         )
         # disabled by default
         self.kv_cache: Optional[KVCache] = None
@@ -634,7 +687,9 @@ class GptNeoxMLP(litgpt.model.GptNeoxMLP):
             bias=config.bias,
             r=(config.lora_r if config.lora_mlp else 0),
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
         )
         self.proj = LoRALinear(
             config.intermediate_size,
@@ -642,7 +697,9 @@ class GptNeoxMLP(litgpt.model.GptNeoxMLP):
             bias=config.bias,
             r=(config.lora_r if config.lora_mlp else 0),
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
         )
 
         self.config = config
@@ -668,7 +725,9 @@ class LLaMAMLP(litgpt.model.LLaMAMLP):
             bias=config.bias,
             r=(config.lora_r if config.lora_mlp else 0),
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
         )
         self.fc_2 = LoRALinear(
             config.n_embd,
@@ -676,7 +735,9 @@ class LLaMAMLP(litgpt.model.LLaMAMLP):
             bias=config.bias,
             r=(config.lora_r if config.lora_mlp else 0),
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
         )
         self.proj = LoRALinear(
             config.intermediate_size,
@@ -684,7 +745,9 @@ class LLaMAMLP(litgpt.model.LLaMAMLP):
             bias=config.bias,
             r=(config.lora_r if config.lora_mlp else 0),
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
         )
 
         self.config = config
@@ -720,7 +783,9 @@ class LLaMAMoE(litgpt.model.LLaMAMoE):
             bias=False,
             r=(config.lora_r if config.lora_mlp else 0),
             lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
+            lora_input_dropout=config.lora_input_dropout,
+            lora_A_dropout=config.lora_A_dropout,
+            lora_B_dropout=config.lora_B_dropout,
         )
         self.experts = nn.ModuleList(LLaMAMLP(config) for _ in range(config.n_expert))
 

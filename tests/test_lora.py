@@ -30,7 +30,9 @@ from litgpt.scripts.convert_hf_checkpoint import copy_weights_hf_llama
 
 
 def test_lora_layer_replacement():
-    config = Config(n_layer=2, n_head=4, n_embd=8, block_size=8, vocab_size=8, lora_r=8, lora_alpha=8, lora_dropout=0.1)
+    config = Config(
+        n_layer=2, n_head=4, n_embd=8, block_size=8, vocab_size=8, lora_r=8, lora_alpha=8, lora_input_dropout=0.1
+    )
     model = LoRAGPT(config)
 
     assert isinstance(model.transformer.h[0].attn, LoRACausalSelfAttention)
@@ -48,7 +50,7 @@ def test_lora_merge():
         vocab_size=8,
         lora_r=8,
         lora_alpha=8,
-        lora_dropout=0.1,
+        lora_input_dropout=0.1,
         lora_query=True,
         lora_value=True,
         lora_projection=True,
@@ -93,7 +95,7 @@ def test_lora_mqa_gqa():
         vocab_size=1,
         lora_r=2,
         lora_alpha=8,
-        lora_dropout=0.1,
+        lora_input_dropout=0.1,
         lora_query=True,
         lora_value=True,
     )
@@ -260,7 +262,7 @@ def test_lora_linear_utilization(apply_to, target_layer_names, mlp_class_name):
         vocab_size=1,
         lora_r=2,
         lora_alpha=8,
-        lora_dropout=0.1,
+        lora_input_dropout=0.1,
         mlp_class_name=mlp_class_name,
         intermediate_size=8 * 3,
         **{apply_to: True},
@@ -288,7 +290,9 @@ def test_lora_linear_utilization(apply_to, target_layer_names, mlp_class_name):
     "apply_to", (None, "lora_query", "lora_key", "lora_value", "lora_projection", "lora_mlp", "lora_head")
 )
 def test_lora_gpt_apply_lora_forward_no_exception(apply_to):
-    config = Config(n_layer=1, n_head=4, n_embd=8, block_size=1, vocab_size=1, lora_r=2, lora_alpha=8, lora_dropout=0.1)
+    config = Config(
+        n_layer=1, n_head=4, n_embd=8, block_size=1, vocab_size=1, lora_r=2, lora_alpha=8, lora_input_dropout=0.1
+    )
     if apply_to:
         setattr(config, apply_to, True)
     input_ids = torch.tensor([[1]])
@@ -314,7 +318,7 @@ def test_lora_gpt_query_groups_merge_and_forward_no_exception(n_query_groups, ap
         vocab_size=1,
         lora_r=2,
         lora_alpha=8,
-        lora_dropout=0.1,
+        lora_input_dropout=0.1,
         n_query_groups=n_query_groups,
         **apply_to,
     )
@@ -396,7 +400,7 @@ def test_lora_merge_with_bitsandbytes():
         vocab_size=8,
         lora_r=8,
         lora_alpha=8,
-        lora_dropout=0.1,
+        lora_input_dropout=0.1,
         lora_query=True,
         lora_value=True,
         lora_projection=True,
@@ -492,7 +496,7 @@ def test_lora_compile():
         n_layer=3,
         lora_r=8,
         lora_alpha=8,
-        lora_dropout=0.1,
+        lora_input_dropout=0.1,
         lora_query=True,
         lora_key=True,
         lora_value=True,
@@ -637,7 +641,7 @@ def test_lora_bitsandbytes(monkeypatch, tmp_path, fake_checkpoint_dir, alpaca_pa
         bias=True,
         lora_r=8,
         lora_alpha=8,
-        lora_dropout=0.1,
+        lora_input_dropout=0.1,
         lora_query=True,
         lora_value=True,
         lora_projection=True,

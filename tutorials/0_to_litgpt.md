@@ -303,7 +303,7 @@ Running the previous finetuning command will initiate the finetuning process, wh
  'eval': EvalArgs(interval=100, max_new_tokens=100, max_iters=100),
  'logger_name': 'csv',
  'lora_alpha': 16,
- 'lora_dropout': 0.05,
+ 'lora_input_dropout': 0.05,
  'lora_head': True,
  'lora_key': True,
  'lora_mlp': True,

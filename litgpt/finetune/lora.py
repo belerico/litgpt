@@ -46,7 +46,10 @@ def setup(
     devices: Union[int, str] = 1,
     lora_r: int = 8,
     lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
+    lora_input_dropout: float = 0.05,
+    lora_A_dropout: float = 0.0,
+    lora_B_dropout: float = 0.0,
+    lora_dropout_samples: int = 1,
     lora_query: bool = True,
     lora_key: bool = False,
     lora_value: bool = True,
@@ -79,7 +82,7 @@ def setup(
         devices: How many devices/GPUs to use.
         lora_r: The LoRA rank.
         lora_alpha: The LoRA alpha.
-        lora_dropout: The LoRA dropout value.
+        lora_input_dropout: The LoRA dropout value.
         lora_query: Whether to apply LoRA to the query weights in attention.
         lora_key: Whether to apply LoRA to the key weights in attention.
         lora_value: Whether to apply LoRA to the value weights in attention.
@@ -103,7 +106,10 @@ def setup(
         checkpoint_dir / "model_config.yaml",
         lora_r=lora_r,
         lora_alpha=lora_alpha,
-        lora_dropout=lora_dropout,
+        lora_input_dropout=lora_input_dropout,
+        lora_A_dropout=lora_A_dropout,
+        lora_B_dropout=lora_B_dropout,
+        lora_dropout_samples=lora_dropout_samples,
         lora_query=lora_query,
         lora_key=lora_key,
         lora_value=lora_value,
@@ -273,11 +279,12 @@ def fit(
 
         is_accumulating = iter_num % train.gradient_accumulation_iters(devices) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids, lm_head_chunk_size=128)
-            # shift the targets such that output n predicts token n+1
-            logits[-1] = logits[-1][..., :-1, :]
-            loss = chunked_cross_entropy(logits, targets[..., 1:])
-            fabric.backward(loss / train.gradient_accumulation_iters(devices))
+            for _ in range(model.config.lora_dropout_samples):
+                logits = model(input_ids, lm_head_chunk_size=128)
+                # shift the targets such that output n predicts token n+1
+                logits[-1] = logits[-1][..., :-1, :]
+                loss = chunked_cross_entropy(logits, targets[..., 1:])
+                fabric.backward(loss / model.config.lora_dropout_samples / train.gradient_accumulation_iters(devices))
 
         running_loss.update(loss.detach())
 

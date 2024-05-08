@@ -21,7 +21,13 @@ lora_r: 32
 lora_alpha: 16
 
 # The LoRA dropout value. (type: float, default: 0.05)
-lora_dropout: 0.05
+lora_input_dropout: 0.05
+
+# The LoRA dropout value applied to the A matrix (type: float, default: 0.0)
+lora_A_dropout: 0.0
+
+# The LoRA dropout value applied to the B matrix (type: float, default: 0.0)
+lora_B_dropout: 0.0
 
 # Whether to apply LoRA to the query weights in attention. (type: bool, default: True)
 lora_query: true

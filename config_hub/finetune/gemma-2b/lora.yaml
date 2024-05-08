@@ -21,7 +21,7 @@ lora_r: 8
 lora_alpha: 16
 
 # The LoRA dropout value. (type: float, default: 0.05)
-lora_dropout: 0.1
+lora_input_dropout: 0.1
 
 # Whether to apply LoRA to the query weights in attention. (type: bool, default: True)
 lora_query: true

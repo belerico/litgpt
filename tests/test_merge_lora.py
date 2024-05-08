@@ -39,7 +39,7 @@ def test_merge_lora(tmp_path, fake_checkpoint_dir, pretrained_dtype, lora_dtype)
     torch.save(state_dict, pretrained_checkpoint_dir / "lit_model.pth")
 
     # Create a fake LoRA checkpoint
-    lora_kwargs = dict(lora_r=8, lora_alpha=16, lora_dropout=0.05, lora_query=True, lora_value=True)
+    lora_kwargs = dict(lora_r=8, lora_alpha=16, lora_input_dropout=0.05, lora_query=True, lora_value=True)
     lora_model = LoRAGPT.from_name("pythia-14m", **config, **lora_kwargs).to(dtype=lora_dtype)
     state_dict = {k: v for k, v in lora_model.state_dict().items() if lora_filter(k, v)}
     assert len(state_dict) == 6
